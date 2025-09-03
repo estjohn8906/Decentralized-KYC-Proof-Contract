@@ -6,9 +6,13 @@
 (define-constant err-expired-proof (err u104))
 (define-constant err-unauthorized (err u105))
 (define-constant err-invalid-tier (err u106))
+(define-constant err-delegation-expired (err u107))
+(define-constant err-delegation-not-found (err u108))
+(define-constant err-invalid-delegation-scope (err u109))
 
 (define-data-var proof-nonce uint u0)
 (define-data-var verification-fee uint u1000000)
+(define-data-var delegation-nonce uint u0)
 
 (define-map kyc-proofs principal {
     proof-hash: (buff 32),
@@ -41,6 +45,18 @@
     verification-tier: uint,
     timestamp: uint
 })
+
+(define-map kyc-delegations uint {
+    delegator: principal,
+    delegatee: principal,
+    scope: uint,
+    created-at: uint,
+    expires-at: uint,
+    is-active: bool,
+    max-tier: uint
+})
+
+(define-map user-delegations principal (list 10 uint))
 
 (define-public (register-verifier)
     (begin
@@ -215,6 +231,84 @@
     )
 )
 
+(define-public (create-kyc-delegation 
+    (delegatee principal) 
+    (scope uint) 
+    (duration uint) 
+    (max-tier uint))
+    (let
+        (
+            (user-proof (unwrap! (map-get? kyc-proofs tx-sender) err-not-found))
+            (current-nonce (+ (var-get delegation-nonce) u1))
+            (expires-at (+ stacks-block-height duration))
+            (current-delegations (default-to (list) (map-get? user-delegations tx-sender)))
+        )
+        (asserts! (is-kyc-verified tx-sender) err-unauthorized)
+        (asserts! (<= scope u3) err-invalid-delegation-scope)
+        (asserts! (<= max-tier (get verification-tier user-proof)) err-invalid-tier)
+        (asserts! (< (len current-delegations) u10) err-unauthorized)
+        
+        (var-set delegation-nonce current-nonce)
+        
+        (map-set kyc-delegations current-nonce {
+            delegator: tx-sender,
+            delegatee: delegatee,
+            scope: scope,
+            created-at: stacks-block-height,
+            expires-at: expires-at,
+            is-active: true,
+            max-tier: max-tier
+        })
+        
+        (map-set user-delegations tx-sender 
+            (unwrap-panic (as-max-len? (append current-delegations current-nonce) u10)))
+        
+        (ok current-nonce)
+    )
+)
+
+(define-public (revoke-delegation (delegation-id uint))
+    (let
+        (
+            (delegation-data (unwrap! (map-get? kyc-delegations delegation-id) err-delegation-not-found))
+        )
+        (asserts! (is-eq tx-sender (get delegator delegation-data)) err-unauthorized)
+        (asserts! (get is-active delegation-data) err-delegation-not-found)
+        
+        (map-set kyc-delegations delegation-id 
+            (merge delegation-data { is-active: false }))
+        
+        (ok true)
+    )
+)
+
+(define-public (verify-via-delegation 
+    (delegation-id uint) 
+    (user principal))
+    (let
+        (
+            (delegation-data (unwrap! (map-get? kyc-delegations delegation-id) err-delegation-not-found))
+            (user-proof (unwrap! (map-get? kyc-proofs user) err-not-found))
+        )
+        (asserts! (is-eq tx-sender (get delegatee delegation-data)) err-unauthorized)
+        (asserts! (is-eq user (get delegator delegation-data)) err-unauthorized)
+        (asserts! (get is-active delegation-data) err-delegation-expired)
+        (asserts! (< stacks-block-height (get expires-at delegation-data)) err-delegation-expired)
+        (asserts! (is-kyc-verified user) err-not-found)
+        (asserts! (<= (get verification-tier user-proof) (get max-tier delegation-data)) err-invalid-tier)
+        
+        (ok {
+            verified: true,
+            verification-tier: (if (<= (get verification-tier user-proof) (get max-tier delegation-data))
+                                 (get verification-tier user-proof)
+                                 (get max-tier delegation-data)),
+            delegator: user,
+            delegation-scope: (get scope delegation-data),
+            expires-at: (get expires-at delegation-data)
+        })
+    )
+)
+
 (define-read-only (get-kyc-status (user principal))
     (match (map-get? kyc-proofs user)
         user-proof (ok {
@@ -279,10 +373,39 @@
     )
 )
 
+(define-read-only (get-delegation-info (delegation-id uint))
+    (map-get? kyc-delegations delegation-id)
+)
+
+(define-read-only (get-user-delegations (user principal))
+    (map-get? user-delegations user)
+)
+
+(define-read-only (is-delegation-active (delegation-id uint))
+    (match (map-get? kyc-delegations delegation-id)
+        delegation-data (and 
+            (get is-active delegation-data)
+            (< stacks-block-height (get expires-at delegation-data)))
+        false
+    )
+)
+
+(define-read-only (get-delegation-scope (delegation-id uint))
+    (match (map-get? kyc-delegations delegation-id)
+        delegation-data (if (and 
+                            (get is-active delegation-data)
+                            (< stacks-block-height (get expires-at delegation-data)))
+                          (get scope delegation-data)
+                          u0)
+        u0
+    )
+)
+
 (define-read-only (get-contract-info)
     (ok {
         owner: contract-owner,
         total-verifications: (var-get proof-nonce),
+        total-delegations: (var-get delegation-nonce),
         verification-fee: (var-get verification-fee),
         contract-version: u1
     })
