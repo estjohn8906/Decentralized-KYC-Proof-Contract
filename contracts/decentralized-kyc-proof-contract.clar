@@ -9,10 +9,16 @@
 (define-constant err-delegation-expired (err u107))
 (define-constant err-delegation-not-found (err u108))
 (define-constant err-invalid-delegation-scope (err u109))
+(define-constant err-already-voted (err u110))
+(define-constant err-consensus-not-found (err u111))
+(define-constant err-threshold-not-met (err u112))
 
 (define-data-var proof-nonce uint u0)
 (define-data-var verification-fee uint u1000000)
 (define-data-var delegation-nonce uint u0)
+(define-data-var consensus-nonce uint u0)
+(define-data-var tier-2-threshold uint u2)
+(define-data-var tier-3-threshold uint u3)
 
 (define-map kyc-proofs principal {
     proof-hash: (buff 32),
@@ -57,6 +63,24 @@
 })
 
 (define-map user-delegations principal (list 10 uint))
+
+(define-map consensus-verifications uint {
+    user: principal,
+    proof-hash: (buff 32),
+    verification-tier: uint,
+    required-votes: uint,
+    current-votes: uint,
+    is-approved: bool,
+    created-at: uint,
+    expires-at: uint
+})
+
+(define-map consensus-votes {consensus-id: uint, verifier: principal} {
+    voted-at: uint,
+    approved: bool
+})
+
+(define-map user-consensus-requests principal (list 5 uint))
 
 (define-public (register-verifier)
     (begin
@@ -309,6 +333,132 @@
     )
 )
 
+(define-public (request-consensus-verification 
+    (proof-hash (buff 32))
+    (verification-tier uint))
+    (let
+        (
+            (user-proof (unwrap! (map-get? kyc-proofs tx-sender) err-not-found))
+            (current-nonce (+ (var-get consensus-nonce) u1))
+            (required-votes (if (is-eq verification-tier u3)
+                               (var-get tier-3-threshold)
+                               (if (is-eq verification-tier u2)
+                                   (var-get tier-2-threshold)
+                                   u1)))
+            (expires-at (+ stacks-block-height u1440))
+            (current-requests (default-to (list) (map-get? user-consensus-requests tx-sender)))
+        )
+        (asserts! (<= verification-tier u3) err-invalid-tier)
+        (asserts! (is-eq (get proof-hash user-proof) proof-hash) err-invalid-proof)
+        (asserts! (< (len current-requests) u5) err-unauthorized)
+        
+        (var-set consensus-nonce current-nonce)
+        
+        (map-set consensus-verifications current-nonce {
+            user: tx-sender,
+            proof-hash: proof-hash,
+            verification-tier: verification-tier,
+            required-votes: required-votes,
+            current-votes: u0,
+            is-approved: false,
+            created-at: stacks-block-height,
+            expires-at: expires-at
+        })
+        
+        (map-set user-consensus-requests tx-sender
+            (unwrap-panic (as-max-len? (append current-requests current-nonce) u5)))
+        
+        (ok current-nonce)
+    )
+)
+
+(define-public (vote-on-consensus (consensus-id uint) (approve bool))
+    (let
+        (
+            (verifier-data (unwrap! (map-get? verifier-registry tx-sender) err-unauthorized))
+            (consensus-data (unwrap! (map-get? consensus-verifications consensus-id) err-consensus-not-found))
+            (vote-key {consensus-id: consensus-id, verifier: tx-sender})
+            (existing-vote (map-get? consensus-votes vote-key))
+        )
+        (asserts! (get is-authorized verifier-data) err-unauthorized)
+        (asserts! (< stacks-block-height (get expires-at consensus-data)) err-expired-proof)
+        (asserts! (not (get is-approved consensus-data)) err-already-verified)
+        (asserts! (is-none existing-vote) err-already-voted)
+        
+        (map-set consensus-votes vote-key {
+            voted-at: stacks-block-height,
+            approved: approve
+        })
+        
+        (if approve
+            (let
+                (
+                    (new-vote-count (+ (get current-votes consensus-data) u1))
+                    (vote-threshold-met (>= new-vote-count (get required-votes consensus-data)))
+                )
+                (map-set consensus-verifications consensus-id
+                    (merge consensus-data { 
+                        current-votes: new-vote-count,
+                        is-approved: vote-threshold-met
+                    }))
+                
+                (if vote-threshold-met
+                    (let
+                        (
+                            (user (get user consensus-data))
+                            (user-proof (unwrap-panic (map-get? kyc-proofs user)))
+                            (current-history-nonce (+ (var-get proof-nonce) u1))
+                        )
+                        (var-set proof-nonce current-history-nonce)
+                        
+                        (map-set kyc-proofs user
+                            (merge user-proof {
+                                verification-tier: (get verification-tier consensus-data),
+                                verified-at: stacks-block-height,
+                                expires-at: (+ stacks-block-height u52560),
+                                status: u2
+                            }))
+                        
+                        (map-set verification-history current-history-nonce {
+                            user: user,
+                            verifier: tx-sender,
+                            proof-hash: (get proof-hash consensus-data),
+                            verification-tier: (get verification-tier consensus-data),
+                            timestamp: stacks-block-height
+                        })
+                        
+                        (map-set verifier-registry tx-sender
+                            (merge verifier-data {
+                                verification-count: (+ (get verification-count verifier-data) u1),
+                                reputation-score: (+ (get reputation-score verifier-data) u10)
+                            }))
+                        
+                        (ok {approved: true, threshold-met: true})
+                    )
+                    (ok {approved: true, threshold-met: false})
+                )
+            )
+            (ok {approved: false, threshold-met: false})
+        )
+    )
+)
+
+(define-public (update-consensus-threshold (tier uint) (threshold uint))
+    (begin
+        (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+        (asserts! (<= tier u3) err-invalid-tier)
+        (asserts! (>= threshold u1) err-invalid-tier)
+        
+        (if (is-eq tier u2)
+            (ok (var-set tier-2-threshold threshold))
+            (if (is-eq tier u3)
+                (ok (var-set tier-3-threshold threshold))
+                err-invalid-tier
+            )
+        )
+    )
+)
+
 (define-read-only (get-kyc-status (user principal))
     (match (map-get? kyc-proofs user)
         user-proof (ok {
@@ -401,11 +551,43 @@
     )
 )
 
+(define-read-only (get-consensus-info (consensus-id uint))
+    (map-get? consensus-verifications consensus-id)
+)
+
+(define-read-only (get-consensus-vote (consensus-id uint) (verifier principal))
+    (map-get? consensus-votes {consensus-id: consensus-id, verifier: verifier})
+)
+
+(define-read-only (get-user-consensus-requests (user principal))
+    (map-get? user-consensus-requests user)
+)
+
+(define-read-only (is-consensus-approved (consensus-id uint))
+    (match (map-get? consensus-verifications consensus-id)
+        consensus-data (get is-approved consensus-data)
+        false
+    )
+)
+
+(define-read-only (get-consensus-threshold (tier uint))
+    (if (is-eq tier u3)
+        (var-get tier-3-threshold)
+        (if (is-eq tier u2)
+            (var-get tier-2-threshold)
+            u1
+        )
+    )
+)
+
 (define-read-only (get-contract-info)
     (ok {
         owner: contract-owner,
         total-verifications: (var-get proof-nonce),
         total-delegations: (var-get delegation-nonce),
+        total-consensus-requests: (var-get consensus-nonce),
+        tier-2-threshold: (var-get tier-2-threshold),
+        tier-3-threshold: (var-get tier-3-threshold),
         verification-fee: (var-get verification-fee),
         contract-version: u1
     })
