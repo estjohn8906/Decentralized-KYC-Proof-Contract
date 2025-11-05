@@ -255,6 +255,28 @@
     )
 )
 
+(define-public (renew-kyc-proof (duration uint))
+    (let
+        (
+            (user-proof (unwrap! (map-get? kyc-proofs tx-sender) err-not-found))
+            (current-nonce (+ (var-get proof-nonce) u1))
+            (new-expires-at (+ (get expires-at user-proof) duration))
+        )
+        (asserts! (> (get status user-proof) u0) err-unauthorized)
+        (asserts! (< stacks-block-height (get expires-at user-proof)) err-expired-proof)
+        (var-set proof-nonce current-nonce)
+        (map-set kyc-proofs tx-sender (merge user-proof { expires-at: new-expires-at }))
+        (map-set verification-history current-nonce {
+            user: tx-sender,
+            verifier: (get verifier user-proof),
+            proof-hash: (get proof-hash user-proof),
+            verification-tier: (get verification-tier user-proof),
+            timestamp: stacks-block-height
+        })
+        (ok new-expires-at)
+    )
+)
+
 (define-public (create-kyc-delegation 
     (delegatee principal) 
     (scope uint) 
