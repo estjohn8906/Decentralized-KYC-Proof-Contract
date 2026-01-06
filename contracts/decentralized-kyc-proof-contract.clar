@@ -20,6 +20,13 @@
 (define-data-var tier-2-threshold uint u2)
 (define-data-var tier-3-threshold uint u3)
 
+(define-constant err-grant-not-found (err u113))
+(define-constant err-grant-expired (err u114))
+(define-constant err-grant-used (err u115))
+(define-constant err-invalid-grant-scope (err u116))
+
+(define-data-var grant-nonce uint u0)
+
 (define-map kyc-proofs principal {
     proof-hash: (buff 32),
     verification-tier: uint,
@@ -613,4 +620,95 @@
         verification-fee: (var-get verification-fee),
         contract-version: u1
     })
+)
+
+
+
+(define-map access-grants uint {
+    owner: principal,
+    viewer: principal,
+    scope: uint,
+    created-at: uint,
+    expires-at: uint,
+    used: bool
+})
+
+(define-public (create-access-grant (viewer principal) (scope uint) (duration uint))
+    (let
+        (
+            (user-proof (unwrap! (map-get? kyc-proofs tx-sender) err-not-found))
+            (current-nonce (+ (var-get grant-nonce) u1))
+            (expires-at (+ stacks-block-height duration))
+        )
+        (asserts! (and (> (get status user-proof) u0) (< stacks-block-height (get expires-at user-proof))) err-unauthorized)
+        (asserts! (<= scope u2) err-invalid-grant-scope)
+        (var-set grant-nonce current-nonce)
+        (map-set access-grants current-nonce {
+            owner: tx-sender,
+            viewer: viewer,
+            scope: scope,
+            created-at: stacks-block-height,
+            expires-at: expires-at,
+            used: false
+        })
+        (ok current-nonce)
+    )
+)
+
+(define-public (consume-access-grant (grant-id uint))
+    (let
+        (
+            (grant (unwrap! (map-get? access-grants grant-id) err-grant-not-found))
+            (grant-viewer (get viewer grant))
+            (owner (get owner grant))
+        )
+        (asserts! (is-eq tx-sender grant-viewer) err-unauthorized)
+        (asserts! (not (get used grant)) err-grant-used)
+        (asserts! (< stacks-block-height (get expires-at grant)) err-grant-expired)
+        (map-set access-grants grant-id (merge grant { used: true }))
+        (match (map-get? kyc-proofs owner)
+            owner-proof 
+                (let
+                    (
+                        (status-data {
+                            verified: (and (> (get status owner-proof) u0) (< stacks-block-height (get expires-at owner-proof))),
+                            verification-tier: (get verification-tier owner-proof),
+                            verified-at: (get verified-at owner-proof),
+                            expires-at: (get expires-at owner-proof),
+                            verifier: (get verifier owner-proof),
+                            is-expired: (>= stacks-block-height (get expires-at owner-proof))
+                        })
+                    )
+                    (ok (if (is-eq (get scope grant) u1)
+                        {
+                            verified: (get verified status-data),
+                            verification-tier: u0,
+                            verified-at: u0,
+                            expires-at: u0,
+                            verifier: contract-owner,
+                            is-expired: (get is-expired status-data)
+                        }
+                        status-data))
+                )
+            (ok {
+                verified: false,
+                verification-tier: u0,
+                verified-at: u0,
+                expires-at: u0,
+                verifier: contract-owner,
+                is-expired: true
+            })
+        )
+    )
+)
+
+(define-read-only (get-access-grant (grant-id uint))
+    (map-get? access-grants grant-id)
+)
+
+(define-read-only (is-access-grant-active (grant-id uint))
+    (match (map-get? access-grants grant-id)
+        grant (and (not (get used grant)) (< stacks-block-height (get expires-at grant)))
+        false
+    )
 )
