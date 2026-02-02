@@ -101,6 +101,43 @@
     )
 )
 
+;; Identity Recovery Feature
+(define-constant err-recovery-not-set (err u117))
+(define-constant err-recovery-unauthorized (err u118))
+(define-constant err-identity-already-exists (err u119))
+
+(define-map recovery-registry principal principal)
+
+(define-public (set-recovery-address (recovery-address principal))
+    (begin
+        (asserts! (is-kyc-verified tx-sender) err-not-found)
+        (ok (map-set recovery-registry tx-sender recovery-address))
+    )
+)
+
+(define-public (recover-identity (old-address principal) (new-address principal))
+    (let
+        (
+            (recovery-addr (unwrap! (map-get? recovery-registry old-address) err-recovery-not-set))
+            (kyc-data (unwrap! (map-get? kyc-proofs old-address) err-not-found))
+        )
+        (asserts! (is-eq tx-sender recovery-addr) err-recovery-unauthorized)
+        (asserts! (is-none (map-get? kyc-proofs new-address)) err-identity-already-exists)
+        
+        (map-set kyc-proofs new-address kyc-data)
+        (map-delete kyc-proofs old-address)
+        
+        (map-set recovery-registry new-address recovery-addr)
+        (map-delete recovery-registry old-address)
+        
+        (ok true)
+    )
+)
+
+(define-read-only (get-recovery-address (user principal))
+    (map-get? recovery-registry user)
+)
+
 (define-public (authorize-verifier (verifier principal))
     (begin
         (asserts! (is-eq tx-sender contract-owner) err-owner-only)
